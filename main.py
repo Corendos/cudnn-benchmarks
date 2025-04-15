@@ -7,14 +7,14 @@ def seed_everything(seed):
     random.seed(seed)
     torch.manual_seed(seed)
 
-RAGGED_UID = 1
-Q_UID = 2
-K_UID = 3
-V_UID = 4
-SEQLEN_Q_UID = 5
-SEQLEN_KV_UID = 6
-PAGE_TABLE_K_UID = 7
-PAGE_TABLE_V_UID = 8
+RAGGED_UID = 8
+Q_UID = 1
+K_UID = 2
+V_UID = 3
+SEQLEN_Q_UID = 4
+SEQLEN_KV_UID = 5
+PAGE_TABLE_K_UID = 6
+PAGE_TABLE_V_UID = 7
 O_UID = 9
 
 
@@ -146,74 +146,25 @@ def build_graph(
 
     return graph
 
-def benchmark_highly_skewed():
-    """Represents a scenario where one sequence has 256 input tokens while all the other have only 1"""
-    token_count = 256 + 255
-    batch_size = 256
-    num_heads = 32
-    num_kv_heads = 8
-    head_size = 128
-    block_size = 16
-    num_blocks = 32768
-    max_input_len = 256
-    scale = 0.08838834765
-
-    max_seq_len = 8192
+def make_inputs(batch_size, token_count, num_heads, num_kv_heads, head_size, num_blocks, block_size, max_seq_len, seq_len):
     max_block_per_seq = max_seq_len // block_size
-
-    seq_len = 2048
-
-    cudnn_handle = cudnn.create_handle()
-
-    graph = build_graph(batch_size, num_heads, num_kv_heads, head_size, block_size, num_blocks, max_input_len, max_seq_len)
 
     query = torch.randn(token_count, num_heads, head_size, dtype=torch.bfloat16)
     o = torch.zeros_like(query)
-    key_cache = torch.randn(num_blocks, num_kv_heads, head_size, block_size, dtype=torch.bfloat16)
-    value_cache = torch.randn(num_blocks, num_kv_heads, head_size, block_size, dtype=torch.bfloat16)
-
-    values = torch.arange(0, num_blocks, dtype=torch.long)
-    values = values[torch.randperm(num_blocks)]
+    key_cache = torch.randn(num_blocks, num_kv_heads, block_size, head_size, dtype=torch.bfloat16)
+    value_cache = torch.randn(num_blocks, num_kv_heads, block_size, head_size, dtype=torch.bfloat16)
 
     block_tables = torch.zeros((batch_size, max_block_per_seq), dtype=torch.int32)
     for i in range(batch_size):
         block_tables[i][0:seq_len//block_size] = torch.randint(0, num_blocks, (seq_len // block_size,), dtype=torch.int32)
+    
+    return query, key_cache, value_cache, block_tables, o
 
-    query_lens = [256] + [1 for i in range(batch_size - 1)]
-    context_lens = [seq_len for query_len in query_lens]
-    seqlen_q = torch.tensor(query_lens, dtype=torch.long)
-    seqlen_kv = torch.tensor([a + b for a, b in zip(query_lens, context_lens)], dtype=torch.long)
-    start_loc = torch.cumsum(torch.tensor([0] + query_lens, dtype=torch.long), dim=0) * num_heads * head_size
-
-    variant_pack = {
-        RAGGED_UID: start_loc,
-        Q_UID: query,
-        K_UID: key_cache,
-        V_UID: value_cache,
-        PAGE_TABLE_K_UID: block_tables,
-        PAGE_TABLE_V_UID: block_tables,
-        O_UID: o,
-        SEQLEN_Q_UID: seqlen_q,
-        SEQLEN_KV_UID: seqlen_kv,
-    }
-
-    start_time = time.time()
-    ITERATIONS = 3000
-    for _ in range(ITERATIONS):
-        graph.execute(variant_pack, 0)
-    torch.cuda.synchronize()
-    end_time = time.time()
-
-    print("Highly skewed scenario")
-    print(f"cudnn Time: {(end_time - start_time)*1000:.2f} ms")
-    print(f"cudnn Time per invocation: {((end_time - start_time) / ITERATIONS)*1000:.2f} ms\n")
-
-    cudnn.destroy_handle(cudnn_handle)
 
 def benchmark_decode_only():
     """Represents a scenario where all the sequence have 1 input token"""
-    token_count = 256
     batch_size = 256
+    token_count = batch_size
     num_heads = 32
     num_kv_heads = 8
     head_size = 128
@@ -223,7 +174,6 @@ def benchmark_decode_only():
     scale = 0.08838834765
 
     max_seq_len = 8192
-    max_block_per_seq = max_seq_len // block_size
 
     seq_len = 2048
 
@@ -231,23 +181,13 @@ def benchmark_decode_only():
 
     graph = build_graph(batch_size, num_heads, num_kv_heads, head_size, block_size, num_blocks, max_input_len, max_seq_len)
 
-    query = torch.randn(token_count, num_heads, head_size, dtype=torch.bfloat16)
-    o = torch.zeros_like(query)
-    key_cache = torch.randn(num_blocks, num_kv_heads, head_size, block_size, dtype=torch.bfloat16)
-    value_cache = torch.randn(num_blocks, num_kv_heads, head_size, block_size, dtype=torch.bfloat16)
-
-    values = torch.arange(0, num_blocks, dtype=torch.long)
-    values = values[torch.randperm(num_blocks)]
-
-    block_tables = torch.zeros((batch_size, max_block_per_seq), dtype=torch.int32)
-    for i in range(batch_size):
-        block_tables[i][0:seq_len//block_size] = torch.randint(0, num_blocks, (seq_len // block_size,), dtype=torch.int32)
+    query, key_cache, value_cache, block_tables, o = make_inputs(batch_size, token_count, num_heads, num_kv_heads, head_size, num_blocks, block_size, max_seq_len, seq_len)
 
     query_lens = [1 for _ in range(batch_size)]
     context_lens = [seq_len for query_len in query_lens]
-    seqlen_q = torch.tensor(query_lens, dtype=torch.long)
-    seqlen_kv = torch.tensor([a + b for a, b in zip(query_lens, context_lens)], dtype=torch.long)
-    start_loc = torch.cumsum(torch.tensor([0] + query_lens, dtype=torch.long), dim=0) * num_heads * head_size
+    seqlen_q = torch.tensor(query_lens, dtype=torch.int32)
+    seqlen_kv = torch.tensor([a + b for a, b in zip(query_lens, context_lens)], dtype=torch.int32)
+    start_loc = torch.cumsum(torch.tensor([0] + query_lens, dtype=torch.int32), dim=0, dtype=torch.int32) * num_heads * head_size
 
     variant_pack = {
         RAGGED_UID: start_loc,
@@ -276,8 +216,8 @@ def benchmark_decode_only():
 
 def benchmark_prefill_only():
     """Represents a scenario where all the sequence have 256 input tokens"""
-    token_count = 256 * 256
     batch_size = 256
+    token_count = 256 * batch_size
     num_heads = 32
     num_kv_heads = 8
     head_size = 128
@@ -287,7 +227,6 @@ def benchmark_prefill_only():
     scale = 0.08838834765
 
     max_seq_len = 8192
-    max_block_per_seq = max_seq_len // block_size
 
     seq_len = 2048
 
@@ -295,23 +234,13 @@ def benchmark_prefill_only():
 
     graph = build_graph(batch_size, num_heads, num_kv_heads, head_size, block_size, num_blocks, max_input_len, max_seq_len)
 
-    query = torch.randn(token_count, num_heads, head_size, dtype=torch.bfloat16)
-    o = torch.zeros_like(query)
-    key_cache = torch.randn(num_blocks, num_kv_heads, head_size, block_size, dtype=torch.bfloat16)
-    value_cache = torch.randn(num_blocks, num_kv_heads, head_size, block_size, dtype=torch.bfloat16)
-
-    values = torch.arange(0, num_blocks, dtype=torch.long)
-    values = values[torch.randperm(num_blocks)]
-
-    block_tables = torch.zeros((batch_size, max_block_per_seq), dtype=torch.int32)
-    for i in range(batch_size):
-        block_tables[i][0:seq_len//block_size] = torch.randint(0, num_blocks, (seq_len // block_size,), dtype=torch.int32)
+    query, key_cache, value_cache, block_tables, o = make_inputs(batch_size, token_count, num_heads, num_kv_heads, head_size, num_blocks, block_size, max_seq_len, seq_len)
 
     query_lens = [256 for _ in range(batch_size)]
     context_lens = [seq_len for query_len in query_lens]
-    seqlen_q = torch.tensor(query_lens, dtype=torch.long)
-    seqlen_kv = torch.tensor([a + b for a, b in zip(query_lens, context_lens)], dtype=torch.long)
-    start_loc = torch.cumsum(torch.tensor([0] + query_lens, dtype=torch.long), dim=0) * num_heads * head_size
+    seqlen_q = torch.tensor(query_lens, dtype=torch.int32)
+    seqlen_kv = torch.tensor([a + b for a, b in zip(query_lens, context_lens)], dtype=torch.int32)
+    start_loc = torch.cumsum(torch.tensor([0] + query_lens, dtype=torch.int32), dim=0, dtype=torch.int32) * num_heads * head_size
 
     variant_pack = {
         RAGGED_UID: start_loc,
@@ -333,6 +262,59 @@ def benchmark_prefill_only():
     end_time = time.time()
 
     print("Prefill only scenario")
+    print(f"cudnn Time: {(end_time - start_time)*1000:.2f} ms")
+    print(f"cudnn Time per invocation: {((end_time - start_time) / ITERATIONS)*1000:.2f} ms\n")
+
+    cudnn.destroy_handle(cudnn_handle)
+
+def benchmark_highly_skewed():
+    """Represents a scenario where one sequence has 256 input tokens while all the other have only 1"""
+    batch_size = 256
+    token_count = batch_size - 1 + 256
+    num_heads = 32
+    num_kv_heads = 8
+    head_size = 128
+    block_size = 16
+    num_blocks = 32768
+    max_input_len = 256
+    scale = 0.08838834765
+
+    max_seq_len = 8192
+
+    seq_len = 2048
+
+    cudnn_handle = cudnn.create_handle()
+
+    graph = build_graph(batch_size, num_heads, num_kv_heads, head_size, block_size, num_blocks, max_input_len, max_seq_len)
+
+    query, key_cache, value_cache, block_tables, o = make_inputs(batch_size, token_count, num_heads, num_kv_heads, head_size, num_blocks, block_size, max_seq_len, seq_len)
+
+    query_lens = [256] + [1 for _ in range(batch_size - 1)]
+    seqlen_q = torch.tensor(query_lens, dtype=torch.int32)
+    context_lens = [seq_len for query_len in query_lens]
+    seqlen_kv = torch.tensor([a + b for a, b in zip(query_lens, context_lens)], dtype=torch.int32)
+    start_loc = torch.cumsum(torch.tensor([0] + query_lens, dtype=torch.int32), dim=0, dtype=torch.int32) * num_heads * head_size
+
+    variant_pack = {
+        RAGGED_UID: start_loc,
+        Q_UID: query,
+        K_UID: key_cache,
+        V_UID: value_cache,
+        PAGE_TABLE_K_UID: block_tables,
+        PAGE_TABLE_V_UID: block_tables,
+        O_UID: o,
+        SEQLEN_Q_UID: seqlen_q,
+        SEQLEN_KV_UID: seqlen_kv,
+    }
+
+    start_time = time.time()
+    ITERATIONS = 3000
+    for _ in range(ITERATIONS):
+        graph.execute(variant_pack, 0)
+    torch.cuda.synchronize()
+    end_time = time.time()
+
+    print("Highly skewed scenario")
     print(f"cudnn Time: {(end_time - start_time)*1000:.2f} ms")
     print(f"cudnn Time per invocation: {((end_time - start_time) / ITERATIONS)*1000:.2f} ms\n")
 
