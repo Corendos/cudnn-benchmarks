@@ -32,6 +32,7 @@ def build_graph(
 
     q_dims = (batch_size, num_heads, max_input_len, head_size)
     q_strides = (num_heads * head_size * max_input_len, head_size, head_size * num_heads, 1)
+    #q_strides = (num_heads * head_size * max_input_len, head_size, head_size, 1)
     paged_k_dims = (num_blocks, num_kv_heads, block_size, head_size)
     paged_k_strides = (num_kv_heads * block_size * head_size, block_size * head_size, head_size, 1)
     paged_v_dims = (num_blocks, num_kv_heads, block_size, head_size)
@@ -146,20 +147,35 @@ def build_graph(
 
     return graph
 
-def make_inputs(batch_size, token_count, num_heads, num_kv_heads, head_size, num_blocks, block_size, max_seq_len, seq_len):
+def make_inputs(batch_size, token_count, num_heads, num_kv_heads, head_size, num_blocks, block_size, max_seq_len, query_lens, context_lens):
     max_block_per_seq = max_seq_len // block_size
 
     query = torch.randn(token_count, num_heads, head_size, dtype=torch.bfloat16)
+    key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_size, dtype=torch.bfloat16)
+    value_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_size, dtype=torch.bfloat16)
+    #print("query: ", query)
+    #print("key_cache: ", key_cache)
+    #print("value_cache: ", value_cache)
+    key_cache = key_cache.transpose(1, 2).contiguous()
+    value_cache = value_cache.transpose(1, 2).contiguous()
     o = torch.zeros_like(query)
-    key_cache = torch.randn(num_blocks, num_kv_heads, block_size, head_size, dtype=torch.bfloat16)
-    value_cache = torch.randn(num_blocks, num_kv_heads, block_size, head_size, dtype=torch.bfloat16)
 
     block_tables = torch.zeros((batch_size, max_block_per_seq), dtype=torch.int32)
     for i in range(batch_size):
-        block_tables[i][0:seq_len//block_size] = torch.randint(0, num_blocks, (seq_len // block_size,), dtype=torch.int32)
+        seq_len = context_lens[i] + query_lens[i]
+        page_count = (seq_len + block_size - 1) // block_size
+        block_tables[i][0:page_count] = torch.randint(0, num_blocks, (page_count,), dtype=torch.int32)
+    
+    print(block_tables)
     
     return query, key_cache, value_cache, block_tables, o
 
+def ground_truth(query, key_cache, value_cache, block_tables):
+    keys = key_cache[block_tables][0:1,0,:,0:1]
+    values = value_cache[block_tables][0:1,0,:,0:1]
+    q = query.transpose(0, 1)
+    o = torch.nn.functional.scaled_dot_product_attention(q, keys, values, is_causal=True, enable_gqa=True)
+    print(o)
 
 def benchmark_decode_only():
     """Represents a scenario where all the sequence have 1 input token"""
@@ -181,13 +197,15 @@ def benchmark_decode_only():
 
     graph = build_graph(batch_size, num_heads, num_kv_heads, head_size, block_size, num_blocks, max_input_len, max_seq_len)
 
-    query, key_cache, value_cache, block_tables, o = make_inputs(batch_size, token_count, num_heads, num_kv_heads, head_size, num_blocks, block_size, max_seq_len, seq_len)
 
     query_lens = [1 for _ in range(batch_size)]
-    context_lens = [seq_len for query_len in query_lens]
+    context_lens = [2048 for query_len in query_lens]
     seqlen_q = torch.tensor(query_lens, dtype=torch.int32)
     seqlen_kv = torch.tensor([a + b for a, b in zip(query_lens, context_lens)], dtype=torch.int32)
     start_loc = torch.cumsum(torch.tensor([0] + query_lens, dtype=torch.int32), dim=0, dtype=torch.int32) * num_heads * head_size
+
+    query, key_cache, value_cache, block_tables, o = make_inputs(batch_size, token_count, num_heads, num_kv_heads, head_size, num_blocks, block_size, max_seq_len, query_lens, context_lens)
+    #ground_truth(query, key_cache, value_cache, block_tables)
 
     variant_pack = {
         RAGGED_UID: start_loc,
@@ -205,6 +223,7 @@ def benchmark_decode_only():
     ITERATIONS = 3000
     for _ in range(ITERATIONS):
         graph.execute(variant_pack, 0)
+        #print(o[:,:])
     torch.cuda.synchronize()
     end_time = time.time()
 
@@ -234,13 +253,13 @@ def benchmark_prefill_only():
 
     graph = build_graph(batch_size, num_heads, num_kv_heads, head_size, block_size, num_blocks, max_input_len, max_seq_len)
 
-    query, key_cache, value_cache, block_tables, o = make_inputs(batch_size, token_count, num_heads, num_kv_heads, head_size, num_blocks, block_size, max_seq_len, seq_len)
-
     query_lens = [256 for _ in range(batch_size)]
-    context_lens = [seq_len for query_len in query_lens]
+    context_lens = [2048 for query_len in query_lens]
     seqlen_q = torch.tensor(query_lens, dtype=torch.int32)
     seqlen_kv = torch.tensor([a + b for a, b in zip(query_lens, context_lens)], dtype=torch.int32)
     start_loc = torch.cumsum(torch.tensor([0] + query_lens, dtype=torch.int32), dim=0, dtype=torch.int32) * num_heads * head_size
+
+    query, key_cache, value_cache, block_tables, o = make_inputs(batch_size, token_count, num_heads, num_kv_heads, head_size, num_blocks, block_size, max_seq_len, query_lens, context_lens)
 
     variant_pack = {
         RAGGED_UID: start_loc,
@@ -258,6 +277,7 @@ def benchmark_prefill_only():
     ITERATIONS = 3000
     for _ in range(ITERATIONS):
         graph.execute(variant_pack, 0)
+        #print(o[:,:])
     torch.cuda.synchronize()
     end_time = time.time()
 
